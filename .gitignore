@@ -1,0 +1,16 @@
+# Node modules (if any)
+node_modules/
+
+# Mac system files
+.DS_Store
+
+# Logs
+*.log
+
+# Chrome extension build artifacts (if any)
+dist/
+build/
+
+# Misc
+*.swp
+*.swo 
