@@ -48,6 +48,9 @@ async function getMetadata(tabs) {
 }
 
 async function groupTabsByClusters(clustersText) {
+  // Get the current active window
+  const currentWindow = await chrome.windows.getCurrent();
+
   // 1. Parse clusters
   const clusterRegex = /\*\*Cluster \d+: (.+?)\*\*([\s\S]+?)(?=\*\*Cluster|$)/g;
   let match;
@@ -65,10 +68,10 @@ async function groupTabsByClusters(clustersText) {
     clusters.push({ name: clusterName, urls });
   }
 
-  // 2. Get all open tabs
-  const tabs = await chrome.tabs.query({});
+  // 2. Get all open tabs in the current window
+  const tabs = await chrome.tabs.query({ windowId: currentWindow.id });
   const allTabUrls = tabs.map(tab => tab.url);
-  console.log('All open tab URLs:', allTabUrls);
+  console.log('All open tab URLs in current window:', allTabUrls);
 
   // Normalization function
   const normalize = url => url ? url.replace(/\/$/, '').replace(/^https?:\/\/(www\.)?/, '') : '';
