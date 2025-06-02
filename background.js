@@ -47,6 +47,52 @@ async function getMetadata(tabs) {
     return metadata;
 }
 
+async function groupTabsByClusters(clustersText) {
+  // 1. Parse clusters
+  const clusterRegex = /\*\*Cluster \d+: (.+?)\*\*([\s\S]+?)(?=\*\*Cluster|$)/g;
+  let match;
+  const clusters = [];
+  while ((match = clusterRegex.exec(clustersText)) !== null) {
+    const clusterName = match[1].trim();
+    const urls = [];
+    // Match both (url) and [text](url) formats
+    const urlRegex = /\((https?:\/\/[^\s)]+)\)|\[(?:[^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+    let urlMatch;
+    while ((urlMatch = urlRegex.exec(match[2])) !== null) {
+      const url = urlMatch[1] || urlMatch[2];
+      if (url) urls.push(url);
+    }
+    clusters.push({ name: clusterName, urls });
+  }
+
+  // 2. Get all open tabs
+  const tabs = await chrome.tabs.query({});
+  const allTabUrls = tabs.map(tab => tab.url);
+  console.log('All open tab URLs:', allTabUrls);
+
+  // Normalization function
+  const normalize = url => url ? url.replace(/\/$/, '').replace(/^https?:\/\/(www\.)?/, '') : '';
+
+  // 3. For each cluster, group tabs
+  for (const cluster of clusters) {
+    console.log('Cluster:', cluster.name);
+    console.log('Cluster URLs:', cluster.urls);
+    const normalizedClusterUrls = cluster.urls.map(normalize);
+    console.log('Normalized Cluster URLs:', normalizedClusterUrls);
+    const tabIds = tabs
+      .filter(tab => tab.url && normalizedClusterUrls.includes(normalize(tab.url)) && !tab.url.startsWith('chrome://'))
+      .map(tab => tab.id);
+    console.log('Matching tab IDs:', tabIds);
+    if (tabIds.length > 0) {
+      const groupId = await chrome.tabs.group({ tabIds });
+      await chrome.tabGroups.update(groupId, { title: cluster.name });
+      console.log(`Created group '${cluster.name}' with groupId:`, groupId);
+    } else {
+      console.log(`No matching tabs found for cluster '${cluster.name}'.`);
+    }
+  }
+}
+
 async function clusterTabs() {
   try {
     // Get all open tabs
@@ -64,6 +110,18 @@ async function clusterTabs() {
     });
 
     console.log('LM Studio response:', response);
+
+    // Extract the LLM's text response (OpenAI format)
+    let llmText = '';
+    if (response.choices && response.choices[0]) {
+      llmText = response.choices[0].message?.content || response.choices[0].text || '';
+    } else if (response.data && typeof response.data === 'string') {
+      llmText = response.data;
+    } else if (typeof response === 'string') {
+      llmText = response;
+    } else {
+      llmText = JSON.stringify(response);
+    }
 
     // Process the clustering results - ensure clusters is always an array
     let clusters = [];
@@ -110,6 +168,12 @@ async function clusterTabs() {
       console.log(cluster.data || cluster);
     }
     
+    // Group tabs in Chrome by clusters
+    await groupTabsByClusters(llmText);
+
+    // Logging for debugging
+    console.log('Processed and grouped clusters.');
+
     return clusters;
   } catch (error) {
     console.error('Error clustering tabs:', error);
