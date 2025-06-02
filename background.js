@@ -23,36 +23,37 @@ const client = {
 
 export { client };
 
-async function getMetadata(tabs) {
-    const metadata = [];
-    for (const tab of tabs) {
-      try {
-        // Use Manifest V3 scripting API instead of executeScript
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          files: ['contentScript.js']
-        });
-        if (results && results[0] && results[0].result) {
-          metadata.push(results[0].result);
-        } else {
-          // Include basic tab info if script returns nothing
-          metadata.push(`${tab.title} - ${tab.url}`);
-        }
-      } catch (error) {
-        console.warn(`Failed to execute script on tab ${tab.id}:`, error);
-        // Include basic tab info even if script execution fails
+async function getMetadataAndExceptions(tabs) {
+  const metadata = [];
+  const exceptionTabIds = [];
+  for (const tab of tabs) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['contentScript.js']
+      });
+      if (results && results[0] && results[0].result) {
+        metadata.push(results[0].result);
+      } else {
         metadata.push(`${tab.title} - ${tab.url}`);
       }
+    } catch (error) {
+      console.warn(`Failed to execute script on tab ${tab.id}:`, error);
+      metadata.push(`${tab.title} - ${tab.url}`);
+      exceptionTabIds.push(tab.id);
     }
-    return metadata;
+  }
+  return { metadata, exceptionTabIds };
 }
 
-async function groupTabsByClusters(clustersText) {
+async function groupTabsByClusters(clustersText, exceptionTabIds) {
   // Get the current active window
   const currentWindow = await chrome.windows.getCurrent();
 
-  // 1. Parse clusters
-  const clusterRegex = /\*\*Cluster \d+: (.+?)\*\*([\s\S]+?)(?=\*\*Cluster|$)/g;
+  console.log('Starting cluster parsing for text:', clustersText.substring(0, 200) + '...');
+
+  // 1. Parse clusters - accept both "Cluster" and "Group" formats
+  const clusterRegex = /\*\*((?:Cluster|Group) \d+: .+?)\*\*([\s\S]+?)(?=\*\*(?:Cluster|Group)|$)/g;
   let match;
   const clusters = [];
   while ((match = clusterRegex.exec(clustersText)) !== null) {
@@ -68,6 +69,14 @@ async function groupTabsByClusters(clustersText) {
     clusters.push({ name: clusterName, urls });
   }
 
+  console.log('Found clusters:', clusters.length);
+  console.log('Parsed clusters:', clusters);
+
+  if (clusters.length === 0) {
+    console.warn('No clusters found! LLM output may not be in expected format.');
+    return;
+  }
+
   // 2. Get all open tabs in the current window
   const tabs = await chrome.tabs.query({ windowId: currentWindow.id });
   const allTabUrls = tabs.map(tab => tab.url);
@@ -76,6 +85,9 @@ async function groupTabsByClusters(clustersText) {
   // Normalization function
   const normalize = url => url ? url.replace(/\/$/, '').replace(/^https?:\/\/(www\.)?/, '') : '';
 
+  // Track all grouped tab IDs
+  let allGroupedTabIds = [];
+
   // 3. For each cluster, group tabs
   for (const cluster of clusters) {
     console.log('Cluster:', cluster.name);
@@ -83,8 +95,14 @@ async function groupTabsByClusters(clustersText) {
     const normalizedClusterUrls = cluster.urls.map(normalize);
     console.log('Normalized Cluster URLs:', normalizedClusterUrls);
     const tabIds = tabs
-      .filter(tab => tab.url && normalizedClusterUrls.includes(normalize(tab.url)) && !tab.url.startsWith('chrome://'))
+      .filter(tab => {
+        if (!tab.url || exceptionTabIds.includes(tab.id)) {
+          return false;
+        }
+        return normalizedClusterUrls.includes(normalize(tab.url));
+      })
       .map(tab => tab.id);
+    allGroupedTabIds = allGroupedTabIds.concat(tabIds);
     console.log('Matching tab IDs:', tabIds);
     if (tabIds.length > 0) {
       const groupId = await chrome.tabs.group({ tabIds });
@@ -94,15 +112,28 @@ async function groupTabsByClusters(clustersText) {
       console.log(`No matching tabs found for cluster '${cluster.name}'.`);
     }
   }
+
+  // Move exception tabs to the right of the rightmost grouped tab
+  if (exceptionTabIds.length > 0 && allGroupedTabIds.length > 0) {
+    // Find the rightmost index among grouped tabs
+    const groupedTabs = tabs.filter(tab => allGroupedTabIds.includes(tab.id));
+    const maxIndex = Math.max(...groupedTabs.map(tab => tab.index));
+    // Move each exception tab to the right of the rightmost grouped tab
+    for (let i = 0; i < exceptionTabIds.length; i++) {
+      await chrome.tabs.move(exceptionTabIds[i], { index: maxIndex + 1 + i });
+      console.log(`Moved exception tab ${exceptionTabIds[i]} to index ${maxIndex + 1 + i}`);
+    }
+  }
 }
 
 async function clusterTabs() {
   try {
-    // Get all open tabs
-    const tabs = await chrome.tabs.query({ currentWindow: true });
+    // Get all open tabs in the current window
+    const currentWindow = await chrome.windows.getCurrent();
+    const tabs = await chrome.tabs.query({ windowId: currentWindow.id });
 
-    // Collect metadata from each tab
-    const metadata = await getMetadata(tabs);
+    // Collect metadata and exception tab IDs
+    const { metadata, exceptionTabIds } = await getMetadataAndExceptions(tabs);
 
     console.log('Collected metadata:', metadata);
 
@@ -126,58 +157,21 @@ async function clusterTabs() {
       llmText = JSON.stringify(response);
     }
 
-    // Process the clustering results - ensure clusters is always an array
-    let clusters = [];
-    
-    if (response && typeof response === 'object') {
-      if (response.data && Array.isArray(response.data)) {
-        clusters = response.data;
-      } else if (Array.isArray(response)) {
-        clusters = response;
-      } else if (response.clusters && Array.isArray(response.clusters)) {
-        clusters = response.clusters;
-      } else if (response.choices && Array.isArray(response.choices)) {
-        // Handle OpenAI-style response format
-        clusters = response.choices.map((choice, index) => ({
-          id: index + 1,
-          data: choice.message?.content || choice.text || choice
-        }));
-      } else {
-        // Create a simple cluster from any response
-        clusters = [{ 
-          id: 1, 
-          data: response.content || response.text || response.message || JSON.stringify(response)
-        }];
-      }
-    } else {
-      // Handle string or other primitive responses
-      clusters = [{ 
-        id: 1, 
-        data: typeof response === 'string' ? response : 'No valid clustering response received'
-      }];
+    console.log('Extracted LLM text:', llmText);
+    console.log('LLM text length:', llmText.length);
+
+    if (!llmText || llmText.length === 0) {
+      console.error('No LLM text extracted!');
+      return [];
     }
 
-    // Ensure clusters is always an array
-    if (!Array.isArray(clusters)) {
-      clusters = [{ id: 1, data: 'Invalid response format' }];
-      
-    }
-
-    console.log('Processing clusters:', clusters);
-
-    // Process the results
-    for (const cluster of clusters) {
-      console.log(`Cluster ${cluster.id || 'Unknown'}:`);
-      console.log(cluster.data || cluster);
-    }
-    
-    // Group tabs in Chrome by clusters
-    await groupTabsByClusters(llmText);
+    // Group tabs in Chrome by clusters, passing exceptionTabIds
+    await groupTabsByClusters(llmText, exceptionTabIds);
 
     // Logging for debugging
     console.log('Processed and grouped clusters.');
 
-    return clusters;
+    return [];
   } catch (error) {
     console.error('Error clustering tabs:', error);
     // Return a default error cluster
